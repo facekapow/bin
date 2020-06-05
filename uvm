@@ -1,0 +1,311 @@
+#!/bin/bash
+
+# TODO: make it cross-platform (for Linux + macOS)
+# i already created a separate version for my macOS machine, i just have to merge it into this one later
+
+# helper functions
+
+errcho() {
+	>&2 echo "$@"
+}
+
+# constants
+
+UVMCFG_PATH="$HOME/.uvmcfg"
+
+# configuration sourcing
+
+eval $(
+	source "$UVMCFG_PATH";
+	echo 'VM_NAME="'$NAME'"';
+	echo 'VM_DISPLAY_NAME="'$DISPLAY_NAME'"';
+	echo 'VM_SSH_PORT="'$SSH_PORT'"';
+	echo 'VM_DEFAULT_USER="'$DEFAULT_USER'"';
+	echo 'VM_MAC_ADDRESS="'$MAC_ADDRESS'"';
+)
+
+# configuration defaults
+
+if [ -z "$VM_DISPLAY_NAME" ]; then
+	VM_DISPLAY_NAME="$VM_NAME"
+fi
+
+if [ -z "$VM_SSH_PORT" ]; then
+	VM_SSH_PORT=22
+fi
+
+# configuration validation
+
+if [ -z "$VM_NAME" ]; then
+	errcho "No value found for \`NAME\` in \`$UVMCFG_PATH\`"
+	exit 1
+fi
+
+if [ -z "$VM_MAC_ADDRESS" ]; then
+	errcho "No value found for \`MAC_ADDRESS\` in \`$UVMCFG_PATH\`"
+	exit 1
+fi
+
+# subcommands
+
+subcommands.running() {
+	local out=$(virsh list --all | grep " $VM_NAME " | awk '{ print $3 }')
+	local POWERED_OFF=0
+	if [ "x$out" == "x" ] || [ "x$out" != "xrunning" ]; then
+		POWERED_OFF=0
+	else
+		POWERED_OFF=1
+	fi
+	local RUNNING=1
+	if [ "$POWERED_OFF" -eq 0 ]; then
+		echo "VM is powered off"
+		RUNNING=1
+	else
+		echo "VM is running"
+		RUNNING=0
+	fi
+	return $RUNNING
+}
+
+subcommands.ip() {
+	local IP=$(arp -n | sed -n -e 's/\([0-9\.]\+\).\+'"$VM_MAC_ADDRESS"'.\+/\1/p')
+	if [ "x$IP" == "x" ]; then
+		errcho "Failed to determine VM name"
+		return 1
+	fi
+	echo "$IP"
+	return 0
+}
+
+subcommands.wait() {
+	until subcommands.ip > /dev/null 2>&1; do
+		sleep 1
+	done
+
+	echo "VM is now accessible over SSH"
+
+	return 0
+}
+
+subcommands.start() {
+	local WAIT=1
+	if [ "x$1" == "x-w" ] || [ "x$1" == "x-wait" ] || [ "x$1" == "x--wait" ]; then
+		WAIT=0
+		shift;
+	fi
+
+	if subcommands.running > /dev/null 2>&1; then
+		echo "VM already running"
+
+		if [ $WAIT -eq 0 ]; then
+			subcommands.wait
+		fi
+
+		return 0
+	fi
+
+	local OUTPUT=$(virsh start "$VM_NAME" 2>&1)
+	local EXIT_CODE=$?
+	if [ "$EXIT_CODE" -ne 0 ]; then
+		errcho "Failed to start the VM."
+		errcho "Command failed with exit code $EXIT_CODE."
+		errcho "Command output:"
+		echo "$OUTPUT"
+		exit 1
+	fi
+
+	echo "VM started successfully"
+
+	if [ $WAIT -eq 0 ]; then
+		subcommands.wait
+	fi
+
+	return 0
+}
+
+subcommands.stop() {
+	local FORCE=0
+	if [ "x$1" == "x-f" ] || [ "x$1" == "x-force" ] || [ "x$1" == "x--force" ]; then
+		FORCE=1
+		shift;
+	fi
+
+	local COMMAND="shutdown"
+	if [ $FORCE -ne 0 ]; then
+		COMMAND="destroy"
+	fi
+
+	local OUTPUT=$(virsh "$COMMAND" "$VM_NAME" 2>&1)
+	local EXIT_CODE=$?
+	if [ "$EXIT_CODE" -ne 0 ]; then
+		errcho "Failed to stop the VM."
+		errcho "Command failed with exit code $EXIT_CODE."
+		errcho "Command output:"
+		echo "$OUTPUT"
+		exit 1
+	fi
+
+	if [ $FORCE -eq 0 ]; then
+		until ! subcommands.running; do
+			sleep 1
+		done
+	fi
+
+	echo "VM stopped successfully"
+}
+
+subcommands.pause() {
+	local OUTPUT=$(virsh suspend "$VM_NAME" 2>&1)
+	local EXIT_CODE=$?
+	if [ "$EXIT_CODE" -ne 0 ]; then
+		errcho "Failed to pause VM."
+		errcho "Command failed with exit code $EXIT_CODE."
+		errcho "Command output:"
+		echo "$OUTPUT"
+		exit 1
+	fi
+
+	echo "VM paused successfully"
+}
+
+subcommands.resume() {
+	local OUTPUT=$(virsh resume "$VM_NAME" 2>&1)
+	local EXIT_CODE=$?
+	if [ "$EXIT_CODE" -ne 0 ]; then
+		errcho "Failed to resume VM."
+		errcho "Command failed with exit code $EXIT_CODE."
+		errcho "Command output:"
+		echo "$OUTPUT"
+		exit 1
+	fi
+
+	echo "VM resumed successfully"
+}
+
+subcommands.ssh() {
+	local VM_USER="$VM_DEFAULT_USER@"
+
+	if [ "$VM_USER" == "@" ]; then
+		VM_USER=""
+	fi
+
+	if [ "x$1" != "x" ]; then
+		VM_USER="$1@"
+		shift;
+	fi
+
+	ssh -p "$VM_SSH_PORT" "$VM_USER$(subcommands.ip)"
+}
+
+subcommands.gui() {
+	local VM_USER="$VM_DEFAULT_USER@"
+
+	if [ "$VM_USER" == "@" ]; then
+		VM_USER=""
+	fi
+
+	if [ "x$1" != "x" ]; then
+		VM_USER="$1@"
+		shift;
+	fi
+
+	ssh -Y -p "$VM_SSH_PORT" "$VM_USER$(subcommands.ip)"
+}
+
+subcommands.help() {
+	>&2 cat <<- EOF
+		Ubuntu Virtual Machine Manager (v1.0.0)
+
+		Subcommands:
+		  start [-w|--wait]	Starts the virtual machine in headless mode. Optionally, if \`-w\`/\`--wait\` is specified, the command will wait for the VM to be accessible over SSH before returning.
+		  stop [-f|--force]	Stops the virtual machine. Tries to shut it down gracefully by default; if \`-f\`/\`--force\` is given, the machine will be powered off instantly.
+		  pause            	Pauses the virtual machine
+		  resume           	Resumes the virtual machine
+		  ssh [user-name]  	Starts an SSH connection with the virtual machine. By default, will start a session as "\$VM_DEFAULT_USER". Optionally, specify a user to start a session as.
+		  gui [user-name]  	Starts an SSH connection with the virtual machine with X11 forwarding enabled. By default, will start a session as "$VM_DEFAULT_USER". Optionally, specify a user to start a session as.
+		  running          	Checks if the VM is running
+		  ip               	Returns the current IP of the virtual machine
+		  wait             	Waits until the VM can be accessed via SSH
+		  help             	Prints this help message and exits
+
+		Configuration:
+		  UVM requires a configuration file with certain information about the VM, located by default at \`~/.uvmcfg\`.
+		  Here's a minimal example:
+		    NAME="my-vm-name"
+		    MAC_ADDRESS="ab:cd:ef:12:34:56"
+		  Here's a list of all the variables that can be defined:
+		    NAME
+		      REQUIRED: yes
+		      DESCRIPTION:
+		        The programatic name of the VM, for CLI command purposes.
+		        This name normally contains no spaces.
+		    MAC_ADDRESS
+		      REQUIRED: yes
+		      DESCRIPTION:
+		        The MAC address of the network card used used in the VM to connect to the internet.
+		        To find this easily, you can run \`virsh domiflist \$VM_NAME\`.
+		    DISPLAY_NAME
+		      DEFAULT: "$NAME"
+		      DESCRIPTION:
+		        The pretty human-friendly name to use for the VM when producing output.
+		    SSH_PORT
+		      DEFAULT: 22
+		      DESCRIPTION:
+		        The port to use by default when starting an SSH session with the VM.
+		    DEFAULT_USER
+		      REQUIRED: no
+		      DESCRIPTION:
+		        The user to login as when starting an SSH session with the VM.
+		        This can be overridden when running \`uvm ssh\` as noted before.
+		        If left unset and no value is provided for \`user-name\` when running \`uvm ssh\`, the decision is
+		        left up to the virtual machine, and it behaves the same as if \`ssh <ip>\` were executed.
+	EOF
+}
+
+# entry logic
+
+if [ "$#" -lt 1 ]; then
+	subcommands.help
+	exit 1
+fi
+
+SUBCOMMAND="$1"
+shift;
+
+case "$SUBCOMMAND" in
+	-h|--help|help)
+		subcommands.help
+		;;
+	start)
+		subcommands.start "$@"
+		;;
+	stop)
+		subcommands.stop "$@"
+		;;
+	pause)
+		subcommands.pause "$@"
+		;;
+	resume)
+		subcommands.resume "$@"
+		;;
+	ssh)
+		subcommands.ssh "$@"
+		;;
+	gui)
+		subcommands.gui "$@"
+		;;
+	running)
+		subcommands.running "$@"
+		;;
+	ip)
+		subcommands.ip "$@"
+		;;
+	wait)
+		subcommands.wait "$@"
+		;;
+	*)
+		errcho "Subcommand \"$SUBCOMMAND\" not recognized"
+		subcommands.help
+		exit 1
+		;;
+esac

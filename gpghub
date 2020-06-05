@@ -1,0 +1,205 @@
+#!/bin/bash
+
+# helper functions
+
+errcho() {
+	>&2 echo "$@"
+}
+
+command-exists() {
+	if ! command -v "$1" > /dev/null 2>&1; then
+		return 1
+	fi
+	return 0
+}
+
+# usage:
+# 	FINGERPRINTS="$(gpg-get-fingerprints <<< "key string...")"
+gpg-get-fingerprints() {
+	gpg --show-keys --with-colons | awk -F: '/fpr:/ {print $10}' | sort -u
+}
+
+# usage:
+# 	gpg-trust <<< "key fingerprints..."
+gpg-trust() {
+	local FINGERPRINTS="$(cat)"
+	while read fpr; do
+		echo -e "5\ny\n" | gpg --batch --command-fd 0 --expert --edit-key $fpr trust > /dev/null 2>&1
+	done <<< "$FINGERPRINTS"
+}
+
+# usage:
+# 	gpg-sign <<< "key fingerprints..."
+gpg-sign() {
+	local FINGERPRINTS="$(cat)"
+	while read fpr; do
+		echo -e "y\ny\n" | gpg --batch --command-fd 0 --expert --edit-key $fpr sign > /dev/null 2>&1
+	done <<< "$FINGERPRINTS"
+}
+
+# subcommands
+
+subcommands.help() {
+	>&2 cat <<- EOF
+		Github GPG key importer (v1.0.0)
+
+		Usage:
+			gpghub [-h|--help|help]
+				Shows this help message
+
+			gpghub import <username> [-y|--yes]
+				Imports all the GPG keys returned by the Github API for the given user
+
+				For each key, it will first ask whether you want to add it. To automatically confirm all the keys, pass the `-y` option.
+	EOF
+}
+
+# hidden subcommand - internal script use only
+subcommands.fetch() {
+	if [ "$#" -lt 1 ]; then
+		errcho "fetch: Missing username"
+		subcommands.help
+		return 1
+	fi
+
+	if [ "$#" -lt 2 ]; then
+		errcho "fetch: Missing variable name"
+		subcommands.help
+		return 1
+	fi
+
+	local USERNAME="$1"
+	shift;
+
+	local OUTPUT_VARIABLE_NAME="$1"
+	shift;
+
+	local URL="https://api.github.com/users/$USERNAME/gpg_keys"
+
+	if ! command-exists 'jq'; then
+		errcho "I need \`jq\` to parse the JSON response from the Github API, but it's not installed (or at least it couldn't be found)"
+		return 1
+	fi
+
+	mapfile -t RESULT_ARRAY <<< $(curl -fsSL "$URL" | jq -c '.[].raw_key // empty')
+
+	# note that here we *have* to do all this array variable passing trickery because
+	# our array entries are multiline strings after they're de-stringified by jq
+	#
+	# that previous `mapfile` command deals with the stringified and escaped JSON strings,
+	# so they're fine to map directly to an array using newlines as delimiters
+	#
+	# here, though, we have go one by one and de-stringify them with jq
+	#
+	# we also *have* to do it in a loop because any other bash automatic transformation trickery
+	# would split at newlines, producing the exact thing we're trying to avoid
+
+	for i in "${!RESULT_ARRAY[@]}"; do
+		RESULT_ARRAY[$i]="$(jq -r '.' <<< "${RESULT_ARRAY[$i]}")"
+	done
+
+	# yes, yes, eval is evil, but i couldn't find a better way of assigning to the variable pointed to by
+	# `$OUTPUT_VARIABLE_NAME`. god i really wish shells had more fleshed out and robust languages
+
+	eval $OUTPUT_VARIABLE_NAME'=("${RESULT_ARRAY[@]}")'
+
+	# i might have to give PowerShell a go; i know it has a much more complete language based on .NET Core
+	# and it's cross platform now!
+	#
+	# then again, i could also write my scripts in something like JS, but then i'd have to have Node.js installed
+	# on any computer that i want to run it and that's sometimes a headache.
+	# plus the syntax for running external commands is quite cumbersome
+}
+
+subcommands.import() {
+	if [ "$#" -lt 1 ]; then
+		errcho "import: Missing username"
+		subcommands.help
+		return 1
+	fi
+
+	local USERNAME=""
+	local AUTOCONFIRM=1
+
+	case "$1" in
+		-y|-yes|--yes)
+			if [ "$#" -lt 2 ]; then
+				USERNAME="$1"
+			else
+				AUTOCONFIRM=0
+			fi
+			;;
+		*)
+			USERNAME="$1"
+			;;
+	esac
+
+	case "$2" in
+		-y|-yes|--yes)
+			AUTOCONFIRM=0
+			;;
+		*)
+			;;
+	esac
+
+	VAR_NAME="GPGHUB_${USERNAME}_GPG_KEYS"
+
+	subcommands.fetch "$USERNAME" "$VAR_NAME"
+
+	eval 'local KEY_ARRAY=("${'${VAR_NAME}'[@]}")'
+
+	for i in "${!KEY_ARRAY[@]}"; do
+		echo "Found key:"
+		echo "$(gpg --show-keys <<< "${KEY_ARRAY[$i]}" | sed 's/^/\t/')"
+
+		local IMPORT_IT=1
+		if [ $AUTOCONFIRM -eq 0 ]; then
+			IMPORT_IT=0
+		else
+			read -r -p "Do you want to add this key? [y/N] " response
+			case "$response" in
+				[yY][eE][sS]|[yY])
+					IMPORT_IT=0
+					;;
+			esac
+		fi
+
+		if [ $IMPORT_IT -eq 0 ]; then
+			local ENCODED_KEY="${KEY_ARRAY[$i]}"
+
+			gpg --import <<< "$ENCODED_KEY" > /dev/null 2>&1
+
+			local FINGERPRINTS="$(gpg-get-fingerprints <<< "$ENCODED_KEY")"
+
+			gpg-trust <<< "$FINGERPRINTS"
+			gpg-sign <<< "$FINGERPRINTS"
+		fi
+	done
+}
+
+# entry logic
+
+if [ "$#" -lt 1 ]; then
+	subcommands.help
+	exit 1
+fi
+
+SUBCOMMAND="$1"
+shift;
+
+case "$SUBCOMMAND" in
+	-h|-help|--help|help)
+		subcommands.help
+		;;
+	import)
+		subcommands.import "$@"
+		;;
+	fetch)
+		subcommands.fetch "$@"
+		;;
+	*)
+		errcho "Subcommand \"$SUBCOMMAND\" not recognized"
+		subcommands.help
+		exit 1
+		;;
+esac
