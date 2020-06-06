@@ -9,9 +9,17 @@ errcho() {
 	>&2 echo "$@"
 }
 
+vm-state() {
+	virsh list --all | grep " $VM_NAME " | awk '{ print $3 }'
+}
+
 # constants
 
 UVMCFG_PATH="$HOME/.uvmcfg"
+
+VM_STATE_RUNNING="running"
+VM_STATE_PAUSED="paused"
+VM_STATE_OFF="powered off"
 
 # configuration sourcing
 
@@ -48,21 +56,31 @@ fi
 
 # subcommands
 
+subcommands.state() {
+	local out=$(vm-state)
+	local STATE="$VM_STATE_OFF"
+	case $out in
+		running)
+			STATE="$VM_STATE_RUNNING"
+			;;
+		paused)
+			STATE="$VM_STATE_PAUSED"
+			;;
+		*)
+			STATE="$VM_STATE_OFF"
+			;;
+	esac
+	echo "$STATE"
+}
+
 subcommands.running() {
-	local out=$(virsh list --all | grep " $VM_NAME " | awk '{ print $3 }')
-	local POWERED_OFF=0
-	if [ "x$out" == "x" ] || [ "x$out" != "xrunning" ]; then
-		POWERED_OFF=0
-	else
-		POWERED_OFF=1
-	fi
 	local RUNNING=1
-	if [ "$POWERED_OFF" -eq 0 ]; then
-		echo "VM is powered off"
-		RUNNING=1
-	else
+	if [ "$(subcommands.state)" == "$VM_STATE_RUNNING" ]; then
 		echo "VM is running"
 		RUNNING=0
+	else
+		echo "VM is powered off"
+		RUNNING=1
 	fi
 	return $RUNNING
 }
@@ -94,6 +112,17 @@ subcommands.start() {
 		shift;
 	fi
 
+	case "$(subcommands.state)" in
+		"$VM_STATE_RUNNING")
+			echo "VM already running"
+			return 0
+			;;
+		"$VM_STATE_PAUSED")
+			echo "VM paused; use \`uvm resume\` to unpause it"
+			return 1
+			;;
+	esac
+
 	if subcommands.running > /dev/null 2>&1; then
 		echo "VM already running"
 
@@ -124,6 +153,13 @@ subcommands.start() {
 }
 
 subcommands.stop() {
+	case "$(subcommands.state)" in
+		"$VM_STATE_OFF")
+			echo "VM already powered off"
+			return 0
+			;;
+	esac
+
 	local FORCE=0
 	if [ "x$1" == "x-f" ] || [ "x$1" == "x-force" ] || [ "x$1" == "x--force" ]; then
 		FORCE=1
@@ -155,6 +191,17 @@ subcommands.stop() {
 }
 
 subcommands.pause() {
+	case "$(subcommands.state)" in
+		"$VM_STATE_PAUSED")
+			echo "VM already paused"
+			return 0
+			;;
+		"$VM_STATE_OFF")
+			echo "VM powered off; can't pause"
+			return 1
+			;;
+	esac
+
 	local OUTPUT=$(virsh suspend "$VM_NAME" 2>&1)
 	local EXIT_CODE=$?
 	if [ "$EXIT_CODE" -ne 0 ]; then
@@ -169,6 +216,17 @@ subcommands.pause() {
 }
 
 subcommands.resume() {
+	case "$(subcommands.state)" in
+		"$VM_STATE_RUNNING")
+			echo "VM already running"
+			return 0
+			;;
+		"$VM_STATE_OFF")
+			echo "VM powered off; can't resume"
+			return 1
+			;;
+	esac
+
 	local OUTPUT=$(virsh resume "$VM_NAME" 2>&1)
 	local EXIT_CODE=$?
 	if [ "$EXIT_CODE" -ne 0 ]; then
@@ -184,14 +242,48 @@ subcommands.resume() {
 
 subcommands.ssh() {
 	local VM_USER="$VM_DEFAULT_USER@"
+	local AUTO_START=1
 
 	if [ "$VM_USER" == "@" ]; then
 		VM_USER=""
 	fi
 
-	if [ "x$1" != "x" ]; then
-		VM_USER="$1@"
-		shift;
+	case "$1" in
+		-s|-start|--start)
+			AUTO_START=0
+			;;
+		*)
+			if [ "x$1" != "x" ]; then
+				VM_USER="$1@"
+			fi
+			;;
+	esac
+
+	case "$2" in
+		-s|-start|--start)
+			AUTO_START=0
+			;;
+		*)
+			if [ "x$2" != "x" ]; then
+				VM_USER="$2@"
+			fi
+			;;
+	esac
+
+	if [ "$AUTO_START" -eq 0 ]; then
+		case "$(subcommands.state)" in
+			"$VM_STATE_PAUSED")
+				subcommands.resume
+				;;
+			"$VM_STATE_OFF")
+				subcommands.start
+				;;
+		esac
+
+		subcommands.wait
+	elif ! subcommands.running > /dev/null 2>&1; then
+		echo "Can't connect over SSH; VM is not running"
+		return 1
 	fi
 
 	ssh -p "$VM_SSH_PORT" "$VM_USER$(subcommands.ip)"
@@ -217,16 +309,17 @@ subcommands.help() {
 		Ubuntu Virtual Machine Manager (v1.0.0)
 
 		Subcommands:
-		  start [-w|--wait]	Starts the virtual machine in headless mode. Optionally, if \`-w\`/\`--wait\` is specified, the command will wait for the VM to be accessible over SSH before returning.
-		  stop [-f|--force]	Stops the virtual machine. Tries to shut it down gracefully by default; if \`-f\`/\`--force\` is given, the machine will be powered off instantly.
-		  pause            	Pauses the virtual machine
-		  resume           	Resumes the virtual machine
-		  ssh [user-name]  	Starts an SSH connection with the virtual machine. By default, will start a session as "\$VM_DEFAULT_USER". Optionally, specify a user to start a session as.
-		  gui [user-name]  	Starts an SSH connection with the virtual machine with X11 forwarding enabled. By default, will start a session as "$VM_DEFAULT_USER". Optionally, specify a user to start a session as.
-		  running          	Checks if the VM is running
-		  ip               	Returns the current IP of the virtual machine
-		  wait             	Waits until the VM can be accessed via SSH
-		  help             	Prints this help message and exits
+		  start [-w|--wait]           	Starts the virtual machine in headless mode. Optionally, if \`-w\`/\`--wait\` is specified, the command will wait for the VM to be accessible over SSH before returning.
+		  stop [-f|--force]           	Stops the virtual machine. Tries to shut it down gracefully by default; if \`-f\`/\`--force\` is given, the machine will be powered off instantly.
+		  pause                       	Pauses the virtual machine
+		  resume                      	Resumes the virtual machine
+		  ssh [user-name] [-s|--start]	Starts an SSH connection with the virtual machine. By default, will start a session as "\$VM_DEFAULT_USER". Optionally, specify a user to start a session as. Also, you can pass \`-s\`/\`--start\` to automatically start/resume the VM if it is not currently running.
+		  gui [user-name]             	Starts an SSH connection with the virtual machine with X11 forwarding enabled. By default, will start a session as "$VM_DEFAULT_USER". Optionally, specify a user to start a session as.
+		  running                     	Checks if the VM is running
+		  ip                          	Returns the current IP of the virtual machine
+		  wait                        	Waits until the VM can be accessed via SSH
+		  state                       	Prints a message indicating the current state of the VM
+		  help                        	Prints this help message and exits
 
 		Configuration:
 		  UVM requires a configuration file with certain information about the VM, located by default at \`~/.uvmcfg\`.
@@ -302,6 +395,9 @@ case "$SUBCOMMAND" in
 		;;
 	wait)
 		subcommands.wait "$@"
+		;;
+	state)
+		subcommands.state "$@"
 		;;
 	*)
 		errcho "Subcommand \"$SUBCOMMAND\" not recognized"
