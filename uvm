@@ -281,6 +281,7 @@ subcommands.ssh() {
 		esac
 
 		subcommands.wait
+		sleep 1
 	elif ! subcommands.running > /dev/null 2>&1; then
 		echo "Can't connect over SSH; VM is not running"
 		return 1
